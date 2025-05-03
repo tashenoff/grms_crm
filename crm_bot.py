@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+# Используем токен напрямую, если переменная окружения не установлена
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7793871539:AAEZ5Jw6_X96YnOUZMPptfogx4ej-SrQJns')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TELEGRAM_API_URL = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
 
@@ -424,89 +425,66 @@ def parse_message_text(text):
     return parsed_data
 
 def save_message(message):
-    """Save message to database and create lead with buttons"""
+    """Save the message to the database and return the lead_id"""
+    message_text = message.get('text', '')
+    message_id = message.get('message_id')
+    
+    # Extract sender information
+    sender_info = get_sender_info(message)
+    if not sender_info:
+        logger.warning("Could not extract sender info")
+        return None
+    
+    sender_id = sender_info.get('id')
+    username = sender_info.get('username', 'Аноним')
+    
+    # Parse message for structured data
+    parsed_data = parse_message_text(message_text)
+    
+    conn = sqlite3.connect('crm.db')
+    cursor = conn.cursor()
+    
     try:
-        logger.info('Saving message to database')
+        # Ensure user exists in the database
+        cursor.execute('''
+            INSERT OR IGNORE INTO users (telegram_id, username)
+            VALUES (?, ?)
+        ''', (sender_id, username))
         
-        # Get sender information
-        sender_info = get_sender_info(message)
-        if not sender_info:
-            logger.warning('No sender information in message')
-            return
-        
-        sender_id = sender_info['id']
-        username = sender_info['username']
-        
-        # Get message text
-        text = message.get('text')
-        if not text:
-            logger.warning('No text in message')
-            return
-            
-        # Parse message text into structured fields
-        parsed_data = parse_message_text(text)
-        parsed_data['source'] = 'сайт'
-        
-        # Save to database
-        conn = sqlite3.connect('crm.db')
-        cursor = conn.cursor()
-        
+        # Insert message as a lead
         cursor.execute('''
             INSERT INTO leads (
                 telegram_id, username, message, 
-                client_name, company, phone, city, address, 
+                client_name, phone, city, address, 
                 order_details, total_amount, order_date, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            sender_id, username, text,
-            parsed_data['client_name'], parsed_data['company'], 
-            parsed_data['phone'], parsed_data['city'], 
-            parsed_data['address'], parsed_data['order_details'], 
-            parsed_data['total_amount'], parsed_data['order_date'], parsed_data['source']
+            sender_id, 
+            username, 
+            message_text,
+            parsed_data.get('client_name', ''),
+            parsed_data.get('phone', ''),
+            parsed_data.get('city', ''),
+            parsed_data.get('address', ''),
+            parsed_data.get('order_details', ''),
+            parsed_data.get('total_amount', ''),
+            parsed_data.get('order_date', ''),
+            parsed_data.get('source', 'telegram')
         ))
         
+        # Get the last inserted ID
         lead_id = cursor.lastrowid
+        logger.info(f"Message saved with lead_id: {lead_id}")
+        
         conn.commit()
-        conn.close()
-        
-        logger.info(f'Message saved with lead_id: {lead_id}')
-        
-        # Delete original message
-        message_id = message.get('message_id')
-        if message_id:
-            delete_message(TELEGRAM_CHAT_ID, message_id)
-        
-        # Format structured message
-        structured_text = f"Новая заявка от {username} (ID: {sender_id})\n\n"
-        
-        if parsed_data['client_name']:
-            structured_text += f"👤 Клиент: {parsed_data['client_name']}\n"
-        if parsed_data['company']:
-            structured_text += f"🏢 Компания: {parsed_data['company']}\n"
-        if parsed_data['phone']:
-            structured_text += f"📞 Телефон: {parsed_data['phone']}\n"
-        if parsed_data['city']:
-            structured_text += f"🏙️ Город: {parsed_data['city']}\n"
-        if parsed_data['address']:
-            structured_text += f"📍 Адрес: {parsed_data['address']}\n"
-        if parsed_data['order_details']:
-            structured_text += f"📦 Заказ: {parsed_data['order_details']}\n"
-        if parsed_data['total_amount']:
-            structured_text += f"💰 Сумма: {parsed_data['total_amount']}\n"
-        if parsed_data['order_date']:
-            structured_text += f"📅 Дата: {parsed_data['order_date']}\n"
-            
-        # If no structured fields were parsed, use original text
-        if structured_text == f"Новая заявка от {username} (ID: {sender_id})\n\n":
-            structured_text += text
-        
-        # Send new message with buttons
-        buttons = create_status_buttons(lead_id)
-        send_message(TELEGRAM_CHAT_ID, structured_text, buttons)
-        
+        return lead_id
     except Exception as e:
-        logger.error(f'Error saving message: {e}')
-        send_message(TELEGRAM_CHAT_ID, f'Ошибка при сохранении заявки: {str(e)}')
+        conn.rollback()
+        logger.error(f"Error saving message: {e}")
+        return None
+    finally:
+        conn.close()
 
 def get_updates(offset=None):
     """Get updates from Telegram API"""
@@ -545,26 +523,38 @@ def answer_callback_query(callback_query_id, text=None, show_alert=True):
     except Exception as e:
         logger.error(f"Error answering callback query: {e}")
 
-def send_message(chat_id, text, buttons=None):
+def send_message(chat_id, text, buttons=None, lead_id=None):
     """Send message to Telegram chat with optional buttons"""
     try:
         data = {
             'chat_id': chat_id,
-            'text': text
+            'text': text,
+            'parse_mode': 'Markdown'
         }
 
         if buttons:
-            data['reply_markup'] = {
-                'inline_keyboard': buttons
-            }
+            data['reply_markup'] = json.dumps({'inline_keyboard': buttons})
 
         response = requests.post(f'{TELEGRAM_API_URL}/sendMessage', json=data)
         response.raise_for_status()
 
-        logger.info(f'Sent message with ID: {response.json().get("result", {}).get("message_id")}')
-        
+        result = response.json()
+        if result.get('ok'):
+            message_id = result['result']['message_id']
+            logger.info(f'Sent message with ID: {message_id}')
+            
+            # Если указан lead_id, сохраняем соответствие message_id -> lead_id
+            if lead_id:
+                save_message_id(lead_id, message_id)
+            
+            return message_id
+        else:
+            logger.error(f'Error sending message: {result}')
+            return None
+
     except Exception as e:
         logger.error(f'Error sending message: {e}')
+        return None
 
 def edit_message(chat_id, message_id, text, buttons=None):
     """Edit message in Telegram chat"""
@@ -589,27 +579,34 @@ def edit_message(chat_id, message_id, text, buttons=None):
         logger.error(f'Error editing message: {e}')
 
 def delete_message(chat_id, message_id):
-    """Delete message from Telegram chat"""
+    """Delete a message from Telegram chat"""
     try:
-        response = requests.post(f'{TELEGRAM_API_URL}/deleteMessage', json={
+        data = {
             'chat_id': chat_id,
             'message_id': message_id
-        })
+        }
+        
+        response = requests.post(f'{TELEGRAM_API_URL}/deleteMessage', json=data)
         response.raise_for_status()
         
         logger.info(f'Deleted message: {message_id}')
         
+        # Отмечаем сообщение как удаленное в БД, если такая запись есть
+        mark_message_deleted(message_id)
+        
+        return True
     except Exception as e:
         logger.error(f'Error deleting message: {e}')
+        return False
 
 def parse_callback_data(data):
-    """Parse callback data from button click (Handles 'status_{status_key}_{lead_id}')"""
+    """Parse callback data from button click (Handles 'status_{status_key}_{lead_id}')"""    
     try:
         # Expected format: status_{status_key}_{lead_id}
-        parts = data.split('_')
-        if len(parts) == 3 and parts[0] == 'status':
-            status = parts[1] # e.g., 'delivery', 'accepted'
-            lead_id = parts[2] # e.g., '4'
+        # Особая обработка для статуса 'in_progress', так как он содержит подчеркивание
+        if 'status_in_progress_' in data:
+            status = 'in_progress'
+            lead_id = data.split('status_in_progress_')[1]
             # Validate lead_id is an integer
             try:
                 int(lead_id)
@@ -618,8 +615,21 @@ def parse_callback_data(data):
                 logger.error(f'Invalid lead_id in callback data: {data}')
                 return None, None
         else:
-            logger.warning(f'Unexpected callback data format: {data}')
-            return None, None
+            # Обработка других статусов
+            parts = data.split('_')
+            if len(parts) == 3 and parts[0] == 'status':
+                status = parts[1] # e.g., 'delivery', 'accepted'
+                lead_id = parts[2] # e.g., '4'
+                # Validate lead_id is an integer
+                try:
+                    int(lead_id)
+                    return status, lead_id
+                except ValueError:
+                    logger.error(f'Invalid lead_id in callback data: {data}')
+                    return None, None
+            else:
+                logger.warning(f'Unexpected callback data format: {data}')
+                return None, None
 
     except Exception as e:
         logger.error(f'Error parsing callback data: {data}, Error: {e}')
@@ -753,75 +763,220 @@ def process_callback_query(update, last_update_id):
     return update['update_id'] + 1, True
 
 def process_message(update, last_update_id):
-    """Process regular message or channel post"""
-    # Check if it's a regular message or channel post
-    message = update.get('message') or update.get('channel_post')
+    """Process a new message update"""
+    message = update.get('message', None) or update.get('channel_post', None)
     if not message:
-        logger.warning('No message found in update')
-        return last_update_id, False
+        logger.warning("No message or channel post in update")
+        return
     
-    chat_id = message.get('chat', {}).get('id')
-    if not chat_id:
-        logger.warning('No chat ID in message')
-        return last_update_id, False
+    logger.info(f"Received message from chat {message.get('chat', {}).get('id')}")
     
-    logger.info(f'Received message from chat {chat_id}')
-    
-    # Check if message is from target chat
-    if str(chat_id) == TELEGRAM_CHAT_ID:
-        logger.info('Message is from target chat')
-        save_message(message)
+    # Check if message is from the target chat
+    if 'chat' in message and message['chat']['id'] == int(TELEGRAM_CHAT_ID):
+        logger.info("Message is from target chat")
+        logger.info("Saving message to database")
+        
+        # Save message to database
+        lead_id = save_message(message)
+        
+        if lead_id:
+            # Construct response message
+            msg_text = f"🆕 *Новая заявка #{lead_id}*\n\n"
+            
+            if 'text' in message:
+                msg_text += f"📝 *Сообщение:* {message['text']}\n"
+            
+            # Extract user info
+            sender = message.get('from')
+            if sender:
+                username = sender.get('username', 'Неизвестно')
+                first_name = sender.get('first_name', 'Аноним')
+                msg_text += f"\n👤 *От:* {first_name}"
+                if username:
+                    msg_text += f" (@{username})"
+            
+            # Delete original message
+            delete_message(message['chat']['id'], message['message_id'])
+            
+            # Send formatted message with buttons
+            send_message(message['chat']['id'], msg_text, create_status_buttons(lead_id), lead_id)
+        else:
+            logger.error("Failed to save message")
     else:
-        logger.info(f'Message is from different chat: {chat_id}')
+        logger.info("Message is not from target chat, ignoring")
+
+def get_lead_message_mapping():
+    """
+    Получение маппинга заявок и сообщений Telegram
+    """
+    conn = sqlite3.connect('crm.db')
+    cursor = conn.cursor()
     
-    return update['update_id'] + 1, True
+    # Выбираем все активные заявки с сообщениями
+    cursor.execute('''
+        SELECT l.id, l.status, m.message_id 
+        FROM leads l
+        JOIN lead_messages m ON l.id = m.lead_id
+        WHERE m.is_deleted = 0
+    ''')
+    
+    results = cursor.fetchall()
+    conn.close()
+    
+    # Преобразуем результаты в словарь {lead_id: (status, message_id)}
+    mapping = {lead_id: (status, message_id) for lead_id, status, message_id in results}
+    return mapping
+
+def sync_lead_statuses():
+    """
+    Синхронизирует статусы заявок в Telegram с актуальными данными из БД
+    """
+    logger.info("=== Начало синхронизации статусов заявок ===")
+    try:
+        # Получаем маппинг заявок и сообщений
+        mapping = get_lead_message_mapping()
+        
+        for lead_id, (old_status, message_id) in mapping.items():
+            # Получаем актуальные данные заявки
+            lead = get_lead_by_id(lead_id)
+            
+            # Если статус изменился, обновляем сообщение
+            if lead and lead['status'] != old_status:
+                logger.info(f"Обновление статуса заявки в Telegram: {lead_id} с {old_status} на {lead['status']}")
+                
+                # Формируем текст сообщения
+                msg_text = f"🆕 *Заявка #{lead['id']}*\n\n"
+                if lead['client_name']:
+                    msg_text += f"👤 *Клиент:* {lead['client_name']}\n"
+                if lead['phone']:
+                    msg_text += f"📞 *Телефон:* {lead['phone']}\n"
+                if lead['message']:
+                    msg_text += f"📝 *Сообщение:* {lead['message']}\n"
+                
+                # Добавляем информацию о статусе и исполнителе
+                status_text = get_status_text(lead['status'])
+                msg_text += f"\n🔄 *Статус:* {status_text}"
+                
+                if lead['executor_username']:
+                    msg_text += f"\n👨‍💼 *Исполнитель:* {lead['executor_username']}"
+                
+                # Обновляем сообщение
+                edit_message(
+                    TELEGRAM_CHAT_ID, 
+                    message_id, 
+                    msg_text,
+                    create_status_buttons(lead_id)
+                )
+    except Exception as e:
+        logger.error(f"Ошибка при синхронизации статусов: {e}")
+    
+    logger.info("=== Завершение синхронизации статусов заявок ===")
+
+# Проверка существования таблицы lead_messages
+def ensure_lead_messages_table():
+    """
+    Создает таблицу для хранения идентификаторов сообщений для заявок, если её нет
+    """
+    conn = sqlite3.connect('crm.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS lead_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER,
+            message_id INTEGER,
+            is_deleted INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (lead_id) REFERENCES leads (id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+
+# Функция для сохранения идентификатора сообщения для заявки
+def save_message_id(lead_id, message_id):
+    """
+    Сохраняет идентификатор отправленного сообщения для заявки
+    """
+    conn = sqlite3.connect('crm.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO lead_messages (lead_id, message_id)
+        VALUES (?, ?)
+    ''', (lead_id, message_id))
+    
+    conn.commit()
+    conn.close()
+
+# Функция для отметки сообщения как удаленного
+def mark_message_deleted(message_id):
+    """
+    Помечает сообщение как удаленное
+    """
+    conn = sqlite3.connect('crm.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE lead_messages 
+        SET is_deleted = 1 
+        WHERE message_id = ?
+    ''', (message_id,))
+    
+    conn.commit()
+    conn.close()
 
 def main():
     """Start the bot"""
     logger.info('Starting CRM bot')
     logger.info(f'Using chat ID: {TELEGRAM_CHAT_ID}')
     
-    # Send startup message without buttons
-    try:
-        send_message(TELEGRAM_CHAT_ID, 'CRM бот запущен и готов принимать заявки!')
-        logger.info('Startup message sent successfully')
-    except Exception as e:
-        logger.error(f'Error sending startup message: {e}')
-        return
+    # Подготавливаем необходимые таблицы
+    ensure_lead_messages_table()
     
     last_update_id = None
+    last_sync_time = 0
+    sync_interval = 10  # Синхронизировать каждые 10 секунд
     
+    # Send startup message
+    chat_id = TELEGRAM_CHAT_ID
+    startup_msg = "🤖 *CRM Telegram Bot запущен*\n\nБот готов принимать и обрабатывать заявки."
+    send_message(chat_id, startup_msg)
+    logger.info("Startup message sent successfully")
+    
+    # Main loop
     while True:
         try:
-            # Get updates from Telegram API
+            # Проверяем, нужно ли сделать синхронизацию
+            current_time = time.time()
+            if current_time - last_sync_time > sync_interval:
+                sync_lead_statuses()
+                last_sync_time = current_time
+            
+            # Обрабатываем обновления
             updates = get_updates(last_update_id)
-            update_count = len(updates.get("result", []))
             
-            if update_count > 0:
-                logger.info(f'Received {update_count} updates')
-            
-            if updates.get('ok', False):
-                for update in updates.get('result', []):
-                    # Process callback queries (button clicks)
-                    new_id, processed = process_callback_query(update, last_update_id)
-                    if processed:
-                        last_update_id = new_id
-                        continue
+            if updates.get('result'):
+                logger.info(f"Received {len(updates['result'])} updates")
+                for update in updates['result']:
+                    if 'update_id' in update:
+                        last_update_id = update['update_id'] + 1
                     
-                    # Process regular messages and channel posts
-                    new_id, processed = process_message(update, last_update_id)
-                    if processed:
-                        last_update_id = new_id
-            else:
-                error_msg = updates.get("description", "Unknown error")
-                logger.error(f'Error in updates response: {error_msg}')
-                time.sleep(10)  
-                
-        except Exception as e:
-            logger.error(f'Error in main loop: {e}')
-            time.sleep(10)  
+                    # Обрабатываем обновления
+                    if 'callback_query' in update:
+                        process_callback_query(update, last_update_id)
+                    elif 'message' in update:
+                        process_message(update, last_update_id)
             
-        time.sleep(5)
+            # Пауза для снижения нагрузки
+            time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            time.sleep(5)
 
 if __name__ == '__main__':
+    ensure_lead_messages_table()
     main()

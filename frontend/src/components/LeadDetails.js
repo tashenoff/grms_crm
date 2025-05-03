@@ -1,8 +1,7 @@
 'use client';
 import React, { useState, useEffect } from 'react';
 import Modal from './Modal';
-
-const API_URL = 'http://192.168.1.66:5000';
+import { API_URL } from '../config';
 
 export default function LeadDetails({ lead, isOpen, onClose }) {
   const [detailedLead, setDetailedLead] = useState(null);

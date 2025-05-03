@@ -1,3 +1,10 @@
 python-telegram-bot==13.7
 python-dotenv==1.0.0
 Flask==2.3.3
+flask-cors==4.0.0
+
+# Инструменты для тестирования
+pytest==7.4.0
+pytest-flask==1.2.0
+pytest-cov==4.1.0
+coverage==7.3.0
